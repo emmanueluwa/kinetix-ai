@@ -1,0 +1,46 @@
+# Environments & Secrets (CRITICAL: Never commit API keys)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python & uv
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Frontend / Node (for upcoming Next.js app)
+node_modules/
+.next/
+out/
+.vercel/
+npm-debug.log*
+pnpm-debug.log*
+
+# Local Data, Uploads & ML Artifacts (Privacy: Never commit test photos)
+uploads/
+tmp/
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.tflite
+*.onnx
+
+# OS & Editor Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
