@@ -1,19 +1,17 @@
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
 import io
-from PIL import Image, ImageOps
+import math
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional
 
 import cv2
 import mediapipe as mp
 import numpy as np
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from PIL import Image, ImageOps
 
 
 @dataclass
@@ -31,12 +29,11 @@ def _default_model_path() -> Path:
     candidate = backend_root / "models" / "pose_landmarker_full.task"
     if candidate.exists():
         return candidate
-    cwd_candidate = Path("models/pose_landmarker_full.task")
-    return cwd_candidate
+    return Path("models/pose_landmarker_full.task")
 
 
 class PhysiqueVisionNormalizer:
-    """Normalizes pose orientation/framing and estimates torso proportions using MediaPipe Tasks PoseLandmarker."""
+    """Normalizes image orientation/roll and estimates torso proportions via MediaPipe PoseLandmarker."""
 
     def __init__(self, model_path: str | Path | None = None) -> None:
         resolved_path = (
@@ -57,31 +54,43 @@ class PhysiqueVisionNormalizer:
             min_pose_presence_confidence=0.5,
             min_tracking_confidence=0.5,
         )
-        self._landmarker = mp_vision.PoseLandmarker.create_from_options(options)
+        self._landmarker: mp_vision.PoseLandmarker | None = (
+            mp_vision.PoseLandmarker.create_from_options(options)
+        )
 
     def close(self) -> None:
-        if getattr(self, "_landmarker", None) is not None:
+        if self._landmarker is not None:
             self._landmarker.close()
             self._landmarker = None
 
     def __del__(self) -> None:
         self.close()
 
-    def normalize_and_measure(self, image_bytes: bytes) -> AlignmentResult:
-        np_buf = np.frombuffer(image_bytes, dtype=np.uint8)
-        bgr = cv2.imdecode(np_buf, cv2.IMREAD_COLOR)
-        if bgr is None:
-            raise ValueError("Unable to decode image bytes for pose normalization.")
+    @staticmethod
+    def _decode_oriented_bgr(image_bytes: bytes) -> np.ndarray:
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as pil_img:
+                transposed = ImageOps.exif_transpose(pil_img).convert("RGB")
+                rgb = np.array(transposed)
+                return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        except Exception as exc:
+            raise ValueError(
+                "Unable to decode image bytes for pose normalization."
+            ) from exc
 
+    def normalize_and_measure(self, image_bytes: bytes) -> AlignmentResult:
+        if self._landmarker is None:
+            raise RuntimeError("PhysiqueVisionNormalizer has already been closed.")
+
+        bgr = self._decode_oriented_bgr(image_bytes)
         h, w, _ = bgr.shape
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         detection = self._landmarker.detect(mp_image)
 
         if not detection.pose_landmarks or len(detection.pose_landmarks) == 0:
-            encoded = self._encode_webp(bgr)
             return AlignmentResult(
-                aligned_image_bytes=encoded,
+                aligned_image_bytes=self._encode_webp(bgr),
                 pose_detected=False,
                 shoulder_to_waist_ratio=None,
                 waist_to_hip_ratio=None,
@@ -102,7 +111,6 @@ class PhysiqueVisionNormalizer:
         shoulder_width_px = math.hypot((r_sh.x - l_sh.x) * w, (r_sh.y - l_sh.y) * h)
         hip_width_px = math.hypot((r_hip.x - l_hip.x) * w, (r_hip.y - l_hip.y) * h)
 
-        # Midpoint angle between shoulders to level horizontal roll
         dy = (r_sh.y - l_sh.y) * h
         dx = (r_sh.x - l_sh.x) * w
         tilt_deg = math.degrees(math.atan2(dy, dx)) if abs(dx) > 1e-6 else 0.0
@@ -110,16 +118,19 @@ class PhysiqueVisionNormalizer:
         center_x = ((l_sh.x + r_sh.x + l_hip.x + r_hip.x) / 4.0) * w
         center_y = ((l_sh.y + r_sh.y + l_hip.y + r_hip.y) / 4.0) * h
 
-        rot_matrix = cv2.getRotationMatrix2D((center_x, center_y), tilt_deg, 1.0)
-        aligned = cv2.warpAffine(
-            bgr,
-            rot_matrix,
-            (w, h),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REPLICATE,
-        )
+        # Only apply small roll correction; avoid aggressive rotation on noisy partial detections
+        if abs(tilt_deg) <= 25.0:
+            rot_matrix = cv2.getRotationMatrix2D((center_x, center_y), tilt_deg, 1.0)
+            aligned = cv2.warpAffine(
+                bgr,
+                rot_matrix,
+                (w, h),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+        else:
+            aligned = bgr
 
-        # Approximate waist width near ~62% down from shoulder midpoint toward hip midpoint
         sh_mid_x = ((l_sh.x + r_sh.x) / 2.0) * w
         sh_mid_y = ((l_sh.y + r_sh.y) / 2.0) * h
         hip_mid_x = ((l_hip.x + r_hip.x) / 2.0) * w
@@ -174,20 +185,8 @@ class PhysiqueVisionNormalizer:
             "keypoints": keypoints,
         }
 
-        encoded = self._encode_webp(aligned)
-
-        try:
-            pil_img = Image.open(io.BytesIO(image_bytes))
-            pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
-            rgb = np.array(pil_img)
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        except Exception as exc:
-            raise ValueError(
-                "Unable to decode image bytes for pose normalization."
-            ) from exc
-
         return AlignmentResult(
-            aligned_image_bytes=encoded,
+            aligned_image_bytes=self._encode_webp(aligned),
             pose_detected=True,
             shoulder_to_waist_ratio=s_to_w,
             waist_to_hip_ratio=w_to_h,

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from enum import Enum
 import os
+from datetime import date
+from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, BinaryContent
@@ -164,6 +166,187 @@ class AICoachService:
                 "pull-ups, dips, squats, and core density blocks when prison-style calisthenics is "
                 "requested). Respect all injury limits and always set completed=false on new tasks."
             ),
+        )
+
+    @staticmethod
+    def build_fallback_assessment(
+        *,
+        role_label: str,
+        goal_summary: str,
+        preferred_style: str,
+        days_since_previous: int | None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "current_shape_summary": (
+                f"{role_label.capitalize()} physique check-in aligned and saved; "
+                "AI coaching summary temporarily unavailable."
+            ),
+            "delta_since_last_checkin": (
+                f"{days_since_previous} day(s) since prior check-in."
+                if days_since_previous is not None
+                else "Initial check-in in series."
+            ),
+            "gap_to_goal": f"Continue progressing toward: {goal_summary}",
+            "verdict": CoachingVerdict.STAY_THE_COURSE.value,
+            "workout_adjustment": {
+                "priority_muscle_groups": ["Full Body"],
+                "volume_and_density_directive": (
+                    "Maintain planned sets, clean technique, and consistent rest periods."
+                ),
+                "next_session_focus_prompt": (
+                    f"Generate a {preferred_style} session aligned with: {goal_summary}."
+                ),
+            },
+            "diet_adjustment": {
+                "caloric_stance": "Goal-aligned energy balance",
+                "protein_and_macro_priority": (
+                    "Prioritize daily protein target and steady hydration."
+                ),
+                "immediate_weekly_habit": (
+                    "Stay consistent with meals and sleep over the next 7 days."
+                ),
+            },
+        }
+        payload["body_composition_summary"] = payload["current_shape_summary"]
+        payload["recommended_training_focus"] = payload["workout_adjustment"][
+            "priority_muscle_groups"
+        ]
+        return payload
+
+    @staticmethod
+    def normalize_assessment_payload(
+        raw_analysis: dict[str, Any] | None,
+        *,
+        role_label: str,
+        days_delta: int | None,
+    ) -> dict[str, Any]:
+        raw = raw_analysis if isinstance(raw_analysis, dict) else {}
+        workout_raw = raw.get("workout_adjustment")
+        diet_raw = raw.get("diet_adjustment")
+
+        priority_groups: list[str] = []
+        if isinstance(workout_raw, dict) and isinstance(
+            workout_raw.get("priority_muscle_groups"), list
+        ):
+            priority_groups = [
+                str(m).strip()
+                for m in workout_raw["priority_muscle_groups"]
+                if str(m).strip()
+            ]
+        if not priority_groups and isinstance(
+            raw.get("recommended_training_focus"), list
+        ):
+            priority_groups = [
+                str(m).strip()
+                for m in raw["recommended_training_focus"]
+                if str(m).strip()
+            ]
+        if not priority_groups:
+            priority_groups = ["Compound strength & conditioning"]
+
+        default_focus_prompt = (
+            f"Prioritize {', '.join(priority_groups[:3])} with disciplined rest "
+            "and progressive compound overload."
+        )
+
+        workout_adjustment = {
+            "priority_muscle_groups": priority_groups[:3],
+            "volume_and_density_directive": (
+                workout_raw.get("volume_and_density_directive")
+                if isinstance(workout_raw, dict)
+                and workout_raw.get("volume_and_density_directive")
+                else "Complete structured compound sets with controlled rest intervals."
+            ),
+            "next_session_focus_prompt": (
+                workout_raw.get("next_session_focus_prompt")
+                if isinstance(workout_raw, dict)
+                and workout_raw.get("next_session_focus_prompt")
+                else default_focus_prompt
+            ),
+        }
+
+        diet_adjustment = {
+            "caloric_stance": (
+                diet_raw.get("caloric_stance")
+                if isinstance(diet_raw, dict) and diet_raw.get("caloric_stance")
+                else "Goal-aligned energy balance"
+            ),
+            "protein_and_macro_priority": (
+                diet_raw.get("protein_and_macro_priority")
+                if isinstance(diet_raw, dict)
+                and diet_raw.get("protein_and_macro_priority")
+                else "Prioritize daily protein target and steady hydration."
+            ),
+            "immediate_weekly_habit": (
+                diet_raw.get("immediate_weekly_habit")
+                if isinstance(diet_raw, dict) and diet_raw.get("immediate_weekly_habit")
+                else "Maintain consistent meal timing and whole-food portions this week."
+            ),
+        }
+
+        return {
+            "current_shape_summary": (
+                raw.get("current_shape_summary")
+                or raw.get("body_composition_summary")
+                or raw.get("summary")
+                or f"{role_label.capitalize()} physique check-in recorded."
+            ),
+            "delta_since_last_checkin": (
+                raw.get("delta_since_last_checkin")
+                or (
+                    f"{days_delta} day(s) since prior check-in."
+                    if days_delta is not None
+                    else "Initial check-in in series."
+                )
+            ),
+            "gap_to_goal": (
+                raw.get("gap_to_goal")
+                or "Align proportions and conditioning with target goal."
+            ),
+            "verdict": raw.get("verdict") or CoachingVerdict.STAY_THE_COURSE.value,
+            "workout_adjustment": workout_adjustment,
+            "diet_adjustment": diet_adjustment,
+        }
+
+    @staticmethod
+    def build_workout_coaching_context(
+        *,
+        plan_date: date,
+        goal_summary: str,
+        preferred_style: str,
+        days_per_week: int,
+        available_equipment: list[str],
+        injuries_or_constraints: str | None,
+        adherence_summary: str,
+        latest_assessment: dict[str, Any] | None,
+        session_request: str | None,
+        regenerate: bool,
+    ) -> str:
+        assessment_context = "No prior physique assessment logged."
+        if latest_assessment is not None:
+            wa = latest_assessment["workout_adjustment"]
+            da = latest_assessment["diet_adjustment"]
+            assessment_context = (
+                f"Verdict: {latest_assessment['verdict']}\n"
+                f"Current Shape: {latest_assessment['current_shape_summary']}\n"
+                f"Progress Delta: {latest_assessment['delta_since_last_checkin']}\n"
+                f"Gap to Goal: {latest_assessment['gap_to_goal']}\n"
+                f"Priority Muscle Groups: {', '.join(wa['priority_muscle_groups'])}\n"
+                f"Volume & Density Directive: {wa['volume_and_density_directive']}\n"
+                f"Recommended Focus Prompt: {wa['next_session_focus_prompt']}\n"
+                f"Diet Stance: {da['caloric_stance']} | {da['protein_and_macro_priority']}"
+            )
+
+        return (
+            f"Target Date: {plan_date.isoformat()}\n"
+            f"Goal & Preferences: {goal_summary}\n"
+            f"Training Style: {preferred_style} ({days_per_week} days/week)\n"
+            f"Available Equipment: {', '.join(available_equipment) or 'Bodyweight only'}\n"
+            f"Injuries / Constraints: {injuries_or_constraints or 'None'}\n"
+            f"Recent Adherence: {adherence_summary}\n"
+            f"Latest Physique Assessment:\n{assessment_context}\n"
+            f"Session Focus Request: {session_request or 'None—apply latest assessment directives and style'}\n"
+            f"Regenerate Variation: {'Yes—provide a fresh variation' if regenerate else 'No'}"
         )
 
     async def evaluate_checkin(

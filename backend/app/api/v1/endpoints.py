@@ -1,19 +1,21 @@
 import uuid
-from datetime import date
-from typing import Annotated, Any
-from datetime import datetime
-from typing import Literal
+from datetime import date, datetime, timedelta, timezone
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
-from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.config import Settings, get_settings
 from app.core.security import AuthenticatedUser, RateLimiter, get_current_user
 from app.db.models import DailyWorkoutPlan, PhotoRole, PhysiquePhoto, UserProfile
-from app.services.ai_coach import AICoachService, PhysiqueCritique, WorkoutPlanOutput
+from app.services.ai_coach import (
+    AICoachService,
+    PhysiqueAssessment,
+    WorkoutPlanOutput,
+)
 from app.services.storage import ObjectStorageService
 from app.services.vision_align import PhysiqueVisionNormalizer
 
@@ -103,6 +105,22 @@ class PhotoAnalysisResponse(BaseModel):
     ai_analysis: dict[str, Any] | None
 
 
+class PhotoHistoryEntryResponse(BaseModel):
+    id: uuid.UUID
+    user_id: uuid.UUID
+    pose_label: str
+    notes: str | None = None
+    preview_url: str
+    days_since_previous: int | None = None
+    created_at: datetime
+    assessment: dict[str, Any]
+
+
+class PhotoHistoryResponse(BaseModel):
+    total: int
+    checkins: list[PhotoHistoryEntryResponse]
+
+
 class DailyWorkoutResponse(BaseModel):
     plan_id: uuid.UUID
     plan_date: date
@@ -121,20 +139,54 @@ class TaskCompletionRequest(BaseModel):
     completed: bool
 
 
-class PhotoHistoryEntryResponse(BaseModel):
-    id: uuid.UUID
-    user_id: uuid.UUID
-    pose_label: str
-    notes: str | None = None
-    preview_url: str
-    days_since_previous: int | None = None
-    created_at: datetime
-    assessment: dict[str, Any]
+async def _compute_adherence_summary(db: AsyncSession, user_id: uuid.UUID) -> str:
+    cutoff = date.today() - timedelta(days=14)
+    stmt = (
+        select(DailyWorkoutPlan)
+        .where(
+            DailyWorkoutPlan.user_id == user_id,
+            DailyWorkoutPlan.plan_date >= cutoff,
+        )
+        .order_by(DailyWorkoutPlan.plan_date.desc())
+        .limit(14)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    if not rows:
+        return "No workout plans recorded in the last 14 days."
+
+    total_tasks = 0
+    completed_tasks = 0
+    active_sessions = 0
+    for plan in rows:
+        tasks = plan.tasks if isinstance(plan.tasks, list) else []
+        done_in_plan = sum(
+            1 for t in tasks if isinstance(t, dict) and bool(t.get("completed"))
+        )
+        total_tasks += len(tasks)
+        completed_tasks += done_in_plan
+        if done_in_plan > 0 or plan.completed:
+            active_sessions += 1
+
+    pct = round((completed_tasks / total_tasks) * 100) if total_tasks else 0
+    return (
+        f"{len(rows)} plans over last 14 days, {active_sessions} with completed work; "
+        f"{completed_tasks}/{total_tasks} tasks completed ({pct}% adherence)."
+    )
 
 
-class PhotoHistoryResponse(BaseModel):
-    total: int
-    checkins: list[PhotoHistoryEntryResponse]
+async def _get_or_create_profile(
+    db: AsyncSession, user_id: uuid.UUID, *, flush_only: bool = False
+) -> UserProfile:
+    profile = await db.get(UserProfile, user_id)
+    if profile is None:
+        profile = UserProfile(user_id=user_id)
+        db.add(profile)
+        if flush_only:
+            await db.flush()
+        else:
+            await db.commit()
+            await db.refresh(profile)
+    return profile
 
 
 @router.get("/profile", response_model=ProfileResponse)
@@ -142,13 +194,7 @@ async def get_profile(
     user: Annotated[AuthenticatedUser, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db_session)],
 ) -> ProfileResponse:
-    profile = await db.get(UserProfile, user.user_id)
-    if profile is None:
-        profile = UserProfile(user_id=user.user_id)
-        db.add(profile)
-        await db.commit()
-        await db.refresh(profile)
-
+    profile = await _get_or_create_profile(db, user.user_id)
     return ProfileResponse(
         user_id=profile.user_id,
         goal_summary=profile.goal_summary,
@@ -167,11 +213,7 @@ async def upsert_profile(
     user: Annotated[AuthenticatedUser, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db_session)],
 ) -> ProfileResponse:
-    profile = await db.get(UserProfile, user.user_id)
-    if profile is None:
-        profile = UserProfile(user_id=user.user_id)
-        db.add(profile)
-
+    profile = await _get_or_create_profile(db, user.user_id, flush_only=True)
     profile.goal_summary = body.goal_summary
     profile.preferred_style = body.preferred_style
     profile.available_equipment = body.available_equipment
@@ -231,11 +273,7 @@ async def process_and_analyze_photo(
             detail="Access denied to storage key outside tenant boundary.",
         )
 
-    profile = await db.get(UserProfile, user.user_id)
-    if profile is None:
-        profile = UserProfile(user_id=user.user_id)
-        db.add(profile)
-        await db.flush()
+    profile = await _get_or_create_profile(db, user.user_id, flush_only=True)
 
     raw_bytes = storage.download_bytes(body.object_key)
     sanitized_bytes = storage.strip_exif_and_encode_webp(raw_bytes)
@@ -246,36 +284,79 @@ async def process_and_analyze_photo(
         aligned_key, norm_result.aligned_image_bytes, content_type="image/webp"
     )
 
-    critique_dict: dict[str, Any] | None = None
-    if body.role == PhotoRole.PROGRESS:
-        baseline_webp: bytes | None = None
-        goal_webp: bytes | None = None
+    latest_stmt = (
+        select(PhysiquePhoto)
+        .where(PhysiquePhoto.user_id == user.user_id)
+        .order_by(PhysiquePhoto.created_at.desc())
+        .limit(1)
+    )
+    previous_photo = (await db.execute(latest_stmt)).scalar_one_or_none()
 
-        if profile.baseline_photo_id:
-            base_photo = await db.get(PhysiquePhoto, profile.baseline_photo_id)
-            if base_photo and base_photo.aligned_storage_key:
-                baseline_webp = storage.download_bytes(base_photo.aligned_storage_key)
+    previous_webp: bytes | None = None
+    baseline_webp: bytes | None = None
+    days_since_previous: int | None = None
 
-        if profile.goal_photo_id:
-            goal_photo = await db.get(PhysiquePhoto, profile.goal_photo_id)
-            if goal_photo and goal_photo.aligned_storage_key:
-                goal_webp = storage.download_bytes(goal_photo.aligned_storage_key)
+    if previous_photo is not None:
+        now_utc = datetime.now(timezone.utc)
+        prev_created = previous_photo.created_at
+        if prev_created.tzinfo is None:
+            prev_created = prev_created.replace(tzinfo=timezone.utc)
+        days_since_previous = max(0, (now_utc - prev_created).days)
+        prev_key = previous_photo.aligned_storage_key or previous_photo.raw_storage_key
+        if prev_key:
+            previous_webp = storage.download_bytes(prev_key)
 
-        metrics_context = (
-            f"User Goal: {profile.goal_summary}\n"
-            f"Current Weight (kg): {body.weight_kg or 'Not logged'}\n"
-            f"MediaPipe Shoulder-to-Waist Ratio: {norm_result.shoulder_to_waist_ratio}\n"
-            f"MediaPipe Waist-to-Hip Ratio: {norm_result.waist_to_hip_ratio}\n"
-            f"User Notes: {body.user_notes or 'None'}"
-        )
+    if profile.baseline_photo_id:
+        base_photo = await db.get(PhysiquePhoto, profile.baseline_photo_id)
+        if (
+            base_photo
+            and (previous_photo is None or base_photo.id != previous_photo.id)
+            and base_photo.aligned_storage_key
+        ):
+            baseline_webp = storage.download_bytes(base_photo.aligned_storage_key)
 
-        critique: PhysiqueCritique = await coach.analyze_physique(
+    adherence_summary = await _compute_adherence_summary(db, user.user_id)
+    swr = (
+        norm_result.shoulder_to_waist_ratio
+        if norm_result.shoulder_to_waist_ratio is not None
+        else "N/A"
+    )
+    whr = (
+        norm_result.waist_to_hip_ratio
+        if norm_result.waist_to_hip_ratio is not None
+        else "N/A"
+    )
+    goal_with_metrics = (
+        f"{profile.goal_summary} "
+        f"(Role: {body.role.value}; "
+        f"Weight: {f'{body.weight_kg} kg' if body.weight_kg is not None else 'unlogged'}; "
+        f"Shoulder:Waist: {swr}; "
+        f"Waist:Hip: {whr}; "
+        f"Notes: {body.user_notes or 'None'})"
+    )
+
+    try:
+        assessment: PhysiqueAssessment = await coach.evaluate_checkin(
             current_webp=norm_result.aligned_image_bytes,
+            previous_webp=previous_webp,
             baseline_webp=baseline_webp,
-            goal_webp=goal_webp,
-            metrics_context=metrics_context,
+            goal_summary=goal_with_metrics,
+            preferred_style=profile.preferred_style,
+            adherence_summary=adherence_summary,
+            days_since_previous=days_since_previous,
         )
-        critique_dict = critique.model_dump()
+        assessment_dict = assessment.model_dump(mode="json")
+        assessment_dict["body_composition_summary"] = assessment.current_shape_summary
+        assessment_dict["recommended_training_focus"] = (
+            assessment.workout_adjustment.priority_muscle_groups
+        )
+    except Exception:
+        assessment_dict = coach.build_fallback_assessment(
+            role_label=body.role.value,
+            goal_summary=profile.goal_summary,
+            preferred_style=profile.preferred_style,
+            days_since_previous=days_since_previous,
+        )
 
     photo = PhysiquePhoto(
         user_id=user.user_id,
@@ -287,7 +368,7 @@ async def process_and_analyze_photo(
         shoulder_to_waist_ratio=norm_result.shoulder_to_waist_ratio,
         waist_to_hip_ratio=norm_result.waist_to_hip_ratio,
         pose_landmarks=norm_result.landmarks_summary,
-        ai_analysis=critique_dict,
+        ai_analysis=assessment_dict,
     )
     db.add(photo)
     await db.flush()
@@ -316,6 +397,7 @@ async def list_photo_history(
     user: Annotated[AuthenticatedUser, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db_session)],
     storage: Annotated[ObjectStorageService, Depends(get_storage)],
+    coach: Annotated[AICoachService, Depends(get_ai_coach)],
     order: Literal["asc", "desc"] = "asc",
     limit: int = 50,
 ) -> PhotoHistoryResponse:
@@ -340,39 +422,11 @@ async def list_photo_history(
 
         key_for_preview = row.aligned_storage_key or row.raw_storage_key
         preview_url = storage.create_presigned_read_url(key_for_preview)
-
-        raw_analysis = row.ai_analysis if isinstance(row.ai_analysis, dict) else {}
-        priority_groups = raw_analysis.get("recommended_training_focus")
-        if not isinstance(priority_groups, list) or not priority_groups:
-            priority_groups = ["Compound strength & conditioning"]
-
-        assessment_payload: dict[str, Any] = {
-            "current_shape_summary": raw_analysis.get("current_shape_summary")
-            or raw_analysis.get("body_composition_summary")
-            or raw_analysis.get("summary")
-            or f"{row.role.value.capitalize()} physique check-in recorded.",
-            "delta_since_last_checkin": raw_analysis.get("delta_since_last_checkin")
-            or (
-                f"{days_delta} day(s) since prior check-in."
-                if days_delta is not None
-                else "Initial check-in in series."
-            ),
-            "gap_to_goal": raw_analysis.get("gap_to_goal")
-            or "Continue consistent training and nutrition execution toward target goal.",
-            "verdict": raw_analysis.get("verdict") or "stay_the_course",
-            "workout_adjustment": raw_analysis.get("workout_adjustment")
-            or {
-                "priority_muscle_groups": priority_groups[:3],
-                "volume_and_density_directive": "Execute structured compound sets and maintain controlled rest periods.",
-                "next_session_focus_prompt": f"Focus today's session on {', '.join(str(x) for x in priority_groups[:3])}.",
-            },
-            "diet_adjustment": raw_analysis.get("diet_adjustment")
-            or {
-                "caloric_stance": "Goal-aligned energy balance",
-                "protein_and_macro_priority": "Hit daily protein target and hydrate consistently.",
-                "immediate_weekly_habit": "Log meals and keep a consistent sleep/training schedule for 7 days.",
-            },
-        }
+        assessment_payload = coach.normalize_assessment_payload(
+            row.ai_analysis,
+            role_label=row.role.value,
+            days_delta=days_delta,
+        )
 
         entries.append(
             PhotoHistoryEntryResponse(
@@ -405,78 +459,11 @@ async def generate_todays_workout(
     coach: Annotated[AICoachService, Depends(get_ai_coach)],
     regenerate: bool = False,
 ) -> DailyWorkoutResponse:
-    today = date.today()
-
-    if not regenerate:
-        existing_stmt = select(DailyWorkoutPlan).where(
-            DailyWorkoutPlan.user_id == user.user_id,
-            DailyWorkoutPlan.plan_date == today,
-        )
-        existing_plan = (await db.execute(existing_stmt)).scalar_one_or_none()
-        if existing_plan is not None:
-            return DailyWorkoutResponse(
-                plan_id=existing_plan.id,
-                plan_date=existing_plan.plan_date,
-                focus_area=existing_plan.focus_area,
-                rationale=existing_plan.rationale,
-                tasks=existing_plan.tasks,
-                completed=existing_plan.completed,
-            )
-
-    profile = await db.get(UserProfile, user.user_id)
-    if profile is None:
-        profile = UserProfile(user_id=user.user_id)
-        db.add(profile)
-        await db.flush()
-
-    latest_photo_stmt = (
-        select(PhysiquePhoto)
-        .where(
-            PhysiquePhoto.user_id == user.user_id,
-            PhysiquePhoto.ai_analysis.is_not(None),
-        )
-        .order_by(PhysiquePhoto.created_at.desc())
-        .limit(1)
-    )
-    latest_photo = (await db.execute(latest_photo_stmt)).scalar_one_or_none()
-    latest_focus = (
-        latest_photo.ai_analysis.get("recommended_training_focus", [])
-        if latest_photo and latest_photo.ai_analysis
-        else ["Full-body balanced hypertrophy"]
-    )
-
-    coaching_context = (
-        f"Goal: {profile.goal_summary}\n"
-        f"Training Style: {profile.preferred_style} ({profile.days_per_week} days/week)\n"
-        f"Available Equipment: {', '.join(profile.available_equipment) or 'Bodyweight only'}\n"
-        f"Injuries / Constraints: {profile.injuries_or_constraints or 'None'}\n"
-        f"Latest Physique Priority Areas: {', '.join(latest_focus)}\n"
-        "Generate today's adaptive workout session."
-    )
-
-    plan_output: WorkoutPlanOutput = await coach.generate_daily_workout(
-        coaching_context=coaching_context
-    )
-
-    plan = DailyWorkoutPlan(
-        user_id=user.user_id,
-        plan_date=today,
-        focus_area=plan_output.focus_area,
-        rationale=plan_output.rationale,
-        tasks=[task.model_dump() for task in plan_output.tasks],
-        completed=False,
-    )
-    db.add(plan)
-    await db.commit()
-    await db.refresh(plan)
-
-    return DailyWorkoutResponse(
-        plan_id=plan.id,
-        plan_date=plan.plan_date,
-        focus_area=plan.focus_area,
-        rationale=plan.rationale,
-        tasks=plan.tasks,
-        completed=plan.completed,
+    return await generate_workout_plan(
+        body=GenerateWorkoutRequest(regenerate=regenerate, session_request=None),
+        user=user,
+        db=db,
+        coach=coach,
     )
 
 
@@ -509,11 +496,7 @@ async def generate_workout_plan(
             completed=existing_plan.completed,
         )
 
-    profile = await db.get(UserProfile, user.user_id)
-    if profile is None:
-        profile = UserProfile(user_id=user.user_id)
-        db.add(profile)
-        await db.flush()
+    profile = await _get_or_create_profile(db, user.user_id, flush_only=True)
 
     latest_photo_stmt = (
         select(PhysiquePhoto)
@@ -525,20 +508,29 @@ async def generate_workout_plan(
         .limit(1)
     )
     latest_photo = (await db.execute(latest_photo_stmt)).scalar_one_or_none()
-    latest_focus = (
-        latest_photo.ai_analysis.get("recommended_training_focus", [])
-        if latest_photo and latest_photo.ai_analysis
-        else ["Compound calisthenics & conditioning"]
+    adherence_summary = await _compute_adherence_summary(db, user.user_id)
+
+    latest_assessment = (
+        coach.normalize_assessment_payload(
+            latest_photo.ai_analysis,
+            role_label=latest_photo.role.value,
+            days_delta=None,
+        )
+        if latest_photo is not None
+        else None
     )
 
-    coaching_context = (
-        f"Goal & Preferences: {profile.goal_summary}\n"
-        f"Training Style: {profile.preferred_style} ({profile.days_per_week} days/week)\n"
-        f"Available Equipment: {', '.join(profile.available_equipment) or 'Bodyweight only'}\n"
-        f"Injuries / Constraints: {profile.injuries_or_constraints or 'None'}\n"
-        f"Latest Physique Priority Areas: {', '.join(latest_focus)}\n"
-        f"Session Focus Request: {body.session_request or 'None—prioritize high-impact compound movements matching style'}\n"
-        f"Regenerate Variation: {'Yes—provide a fresh variation' if body.regenerate else 'No'}"
+    coaching_context = coach.build_workout_coaching_context(
+        plan_date=today,
+        goal_summary=profile.goal_summary,
+        preferred_style=profile.preferred_style,
+        days_per_week=profile.days_per_week,
+        available_equipment=profile.available_equipment,
+        injuries_or_constraints=profile.injuries_or_constraints,
+        adherence_summary=adherence_summary,
+        latest_assessment=latest_assessment,
+        session_request=body.session_request,
+        regenerate=body.regenerate,
     )
 
     plan_output: WorkoutPlanOutput = await coach.generate_daily_workout(

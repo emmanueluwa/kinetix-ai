@@ -44,10 +44,14 @@ class UserProfile(Base):
     days_per_week: Mapped[int] = mapped_column(default=4)
 
     baseline_photo_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey("physique_photos.id", ondelete="SET NULL", use_alter=True),
+        nullable=True,
     )
     goal_photo_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey("physique_photos.id", ondelete="SET NULL", use_alter=True),
+        nullable=True,
     )
 
     created_at: Mapped[datetime] = mapped_column(
@@ -58,7 +62,9 @@ class UserProfile(Base):
     )
 
     photos: Mapped[list["PhysiquePhoto"]] = relationship(
-        back_populates="user", cascade="all, delete-orphan"
+        back_populates="user",
+        foreign_keys="PhysiquePhoto.user_id",
+        cascade="all, delete-orphan",
     )
     workout_plans: Mapped[list["DailyWorkoutPlan"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
@@ -103,7 +109,10 @@ class PhysiquePhoto(Base):
         DateTime(timezone=True), server_default=func.now()
     )
 
-    user: Mapped["UserProfile"] = relationship(back_populates="photos")
+    user: Mapped["UserProfile"] = relationship(
+        back_populates="photos",
+        foreign_keys=[user_id],
+    )
 
 
 class DailyWorkoutPlan(Base):
