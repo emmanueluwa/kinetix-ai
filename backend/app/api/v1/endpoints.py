@@ -1,6 +1,8 @@
 import uuid
 from datetime import date
 from typing import Annotated, Any
+from datetime import datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -117,6 +119,22 @@ class GenerateWorkoutRequest(BaseModel):
 
 class TaskCompletionRequest(BaseModel):
     completed: bool
+
+
+class PhotoHistoryEntryResponse(BaseModel):
+    id: uuid.UUID
+    user_id: uuid.UUID
+    pose_label: str
+    notes: str | None = None
+    preview_url: str
+    days_since_previous: int | None = None
+    created_at: datetime
+    assessment: dict[str, Any]
+
+
+class PhotoHistoryResponse(BaseModel):
+    total: int
+    checkins: list[PhotoHistoryEntryResponse]
 
 
 @router.get("/profile", response_model=ProfileResponse)
@@ -291,6 +309,89 @@ async def process_and_analyze_photo(
         waist_to_hip_ratio=photo.waist_to_hip_ratio,
         ai_analysis=photo.ai_analysis,
     )
+
+
+@router.get("/photos", response_model=PhotoHistoryResponse)
+async def list_photo_history(
+    user: Annotated[AuthenticatedUser, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db_session)],
+    storage: Annotated[ObjectStorageService, Depends(get_storage)],
+    order: Literal["asc", "desc"] = "asc",
+    limit: int = 50,
+) -> PhotoHistoryResponse:
+    clamped_limit = max(1, min(limit, 200))
+    stmt = (
+        select(PhysiquePhoto)
+        .where(PhysiquePhoto.user_id == user.user_id)
+        .order_by(PhysiquePhoto.created_at.asc())
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+
+    entries: list[PhotoHistoryEntryResponse] = []
+    prev_created_at: datetime | None = None
+
+    for row in rows:
+        days_delta = (
+            max(0, (row.created_at - prev_created_at).days)
+            if prev_created_at is not None
+            else None
+        )
+        prev_created_at = row.created_at
+
+        key_for_preview = row.aligned_storage_key or row.raw_storage_key
+        preview_url = storage.create_presigned_read_url(key_for_preview)
+
+        raw_analysis = row.ai_analysis if isinstance(row.ai_analysis, dict) else {}
+        priority_groups = raw_analysis.get("recommended_training_focus")
+        if not isinstance(priority_groups, list) or not priority_groups:
+            priority_groups = ["Compound strength & conditioning"]
+
+        assessment_payload: dict[str, Any] = {
+            "current_shape_summary": raw_analysis.get("current_shape_summary")
+            or raw_analysis.get("body_composition_summary")
+            or raw_analysis.get("summary")
+            or f"{row.role.value.capitalize()} physique check-in recorded.",
+            "delta_since_last_checkin": raw_analysis.get("delta_since_last_checkin")
+            or (
+                f"{days_delta} day(s) since prior check-in."
+                if days_delta is not None
+                else "Initial check-in in series."
+            ),
+            "gap_to_goal": raw_analysis.get("gap_to_goal")
+            or "Continue consistent training and nutrition execution toward target goal.",
+            "verdict": raw_analysis.get("verdict") or "stay_the_course",
+            "workout_adjustment": raw_analysis.get("workout_adjustment")
+            or {
+                "priority_muscle_groups": priority_groups[:3],
+                "volume_and_density_directive": "Execute structured compound sets and maintain controlled rest periods.",
+                "next_session_focus_prompt": f"Focus today's session on {', '.join(str(x) for x in priority_groups[:3])}.",
+            },
+            "diet_adjustment": raw_analysis.get("diet_adjustment")
+            or {
+                "caloric_stance": "Goal-aligned energy balance",
+                "protein_and_macro_priority": "Hit daily protein target and hydrate consistently.",
+                "immediate_weekly_habit": "Log meals and keep a consistent sleep/training schedule for 7 days.",
+            },
+        }
+
+        entries.append(
+            PhotoHistoryEntryResponse(
+                id=row.id,
+                user_id=row.user_id,
+                pose_label=row.role.value,
+                notes=row.user_notes,
+                preview_url=preview_url,
+                days_since_previous=days_delta,
+                created_at=row.created_at,
+                assessment=assessment_payload,
+            )
+        )
+
+    if order == "desc":
+        entries.reverse()
+
+    sliced = entries[:clamped_limit]
+    return PhotoHistoryResponse(total=len(entries), checkins=sliced)
 
 
 @router.post(

@@ -1,26 +1,47 @@
 "use client";
 
-import { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { api, DailyWorkout } from "@/lib/api";
 
-interface WorkoutBoardProps {
+export interface WorkoutBoardProps {
   token: string | null;
   onStatusChange: (msg: string) => void;
   onError: (msg: string | null) => void;
+  externalFocusRequest?: {
+    id: string;
+    prompt: string;
+    autoGenerate?: boolean;
+  } | null;
+  onExternalFocusConsumed?: (requestId: string) => void;
+  onWorkoutChange?: (workout: DailyWorkout | null) => void;
 }
 
 export function WorkoutBoard({
   token,
   onStatusChange,
   onError,
+  externalFocusRequest = null,
+  onExternalFocusConsumed,
+  onWorkoutChange,
 }: WorkoutBoardProps) {
   const [workout, setWorkout] = useState<DailyWorkout | null>(null);
   const [sessionFocus, setSessionFocus] = useState("");
   const [loadingWorkout, setLoadingWorkout] = useState(false);
   const [togglingTaskIdx, setTogglingTaskIdx] = useState<number | null>(null);
 
-  async function handleGenerateWorkout(regenerate: boolean) {
-    if (!token) return;
+  const runWorkoutGeneration = async (
+    regenerate: boolean,
+    focusOverride?: string,
+  ) => {
+    if (!token || loadingWorkout) {
+      return;
+    }
+
+    const effectiveFocus =
+      typeof focusOverride === "string"
+        ? focusOverride.trim()
+        : sessionFocus.trim();
+
     setLoadingWorkout(true);
     onError(null);
     onStatusChange(
@@ -28,28 +49,67 @@ export function WorkoutBoard({
         ? "Regenerating bespoke plan..."
         : "Generating bespoke plan...",
     );
+
     try {
-      const plan = await api.generateWorkout(token, regenerate, sessionFocus);
+      const plan = await api.generateWorkout(
+        token,
+        regenerate,
+        effectiveFocus || null,
+      );
       setWorkout(plan);
+      onWorkoutChange?.(plan);
       onStatusChange("Workout ready");
     } catch (err) {
       onError(err instanceof Error ? err.message : "Workout generation failed");
+      onStatusChange("Workout error");
     } finally {
       setLoadingWorkout(false);
     }
+  };
+
+  useEffect(() => {
+    if (!externalFocusRequest || !token) {
+      return;
+    }
+
+    const nextPrompt = externalFocusRequest.prompt.trim();
+    if (!nextPrompt) {
+      onExternalFocusConsumed?.(externalFocusRequest.id);
+      return;
+    }
+
+    setSessionFocus(nextPrompt);
+
+    if (externalFocusRequest.autoGenerate) {
+      void runWorkoutGeneration(true, nextPrompt).finally(() => {
+        onExternalFocusConsumed?.(externalFocusRequest.id);
+      });
+    } else {
+      onExternalFocusConsumed?.(externalFocusRequest.id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [externalFocusRequest, token]);
+
+  async function handleGenerateWorkout(regenerate: boolean) {
+    await runWorkoutGeneration(regenerate);
   }
 
   async function handleToggleTask(taskIndex: number, nextCompleted: boolean) {
     const workoutId = workout?.plan_id ?? workout?.id;
-    if (!token || !workout || !workoutId) return;
+    if (!token || !workout || !workoutId) {
+      return;
+    }
 
     const previousWorkout = workout;
-    setWorkout({
+    const optimisticWorkout: DailyWorkout = {
       ...workout,
       tasks: workout.tasks.map((item, idx) =>
         idx === taskIndex ? { ...item, completed: nextCompleted } : item,
       ),
-    });
+    };
+
+    setWorkout(optimisticWorkout);
+    onWorkoutChange?.(optimisticWorkout);
 
     setTogglingTaskIdx(taskIndex);
     onError(null);
@@ -61,9 +121,11 @@ export function WorkoutBoard({
         nextCompleted,
       );
       setWorkout(updated);
+      onWorkoutChange?.(updated);
       onStatusChange(nextCompleted ? "Task completed" : "Task unmarked");
     } catch (err) {
       setWorkout(previousWorkout);
+      onWorkoutChange?.(previousWorkout);
       onError(err instanceof Error ? err.message : "Failed to update task");
     } finally {
       setTogglingTaskIdx(null);
@@ -90,7 +152,7 @@ export function WorkoutBoard({
           <button
             type="button"
             disabled={!token || loadingWorkout}
-            onClick={() => handleGenerateWorkout(false)}
+            onClick={() => void handleGenerateWorkout(false)}
             className="min-h-11 bg-zinc-100 hover:bg-white disabled:opacity-50 text-zinc-950 text-sm font-semibold px-4 py-2 rounded-xl transition cursor-pointer"
           >
             {loadingWorkout ? "Generating..." : "Today's Plan"}
@@ -98,7 +160,7 @@ export function WorkoutBoard({
           <button
             type="button"
             disabled={!token || loadingWorkout}
-            onClick={() => handleGenerateWorkout(true)}
+            onClick={() => void handleGenerateWorkout(true)}
             className="min-h-11 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 text-zinc-200 text-sm px-3.5 py-2 rounded-xl transition cursor-pointer"
           >
             Regenerate
@@ -158,7 +220,7 @@ export function WorkoutBoard({
                         checked={isDone}
                         disabled={togglingTaskIdx === idx}
                         onChange={(e) =>
-                          handleToggleTask(idx, e.target.checked)
+                          void handleToggleTask(idx, e.target.checked)
                         }
                         className="mt-0.5 h-5 w-5 rounded accent-emerald-500 cursor-pointer shrink-0"
                       />

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from enum import Enum
 import os
+
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, BinaryContent
 from pydantic_ai.models.xai import XaiModel
@@ -8,6 +10,55 @@ from pydantic_ai.providers.xai import XaiProvider
 from pydantic_ai.settings import ModelSettings
 
 from app.core.config import Settings, get_settings
+
+
+class CoachingVerdict(str, Enum):
+    STAY_THE_COURSE = "stay_the_course"
+    TIGHTEN_NUTRITION = "tighten_nutrition"
+    INCREASE_FUEL = "increase_fuel"
+    PIVOT_VOLUME = "pivot_volume"
+    DELOAD_RECOVER = "deload_recover"
+
+
+class WorkoutAdjustment(BaseModel):
+    priority_muscle_groups: list[str] = Field(
+        min_length=1,
+        max_length=3,
+        description="Top 1-3 visual lagging areas or movement patterns to prioritize next.",
+    )
+    volume_and_density_directive: str = Field(
+        description="Concrete programming rule (e.g., 'Add 2 density sets of horizontal pulls; keep rest under 45s')."
+    )
+    next_session_focus_prompt: str = Field(
+        description="Ready-to-use prompt string that can be injected directly into POST /workouts/generate."
+    )
+
+
+class DietAdjustment(BaseModel):
+    caloric_stance: str = Field(
+        description="Directional energy balance based on shape vs. goal (e.g., 'Moderate deficit (-300 to -400 kcal)', 'Maintenance / Recomp', 'Lean surplus (+250 kcal)')."
+    )
+    protein_and_macro_priority: str = Field(
+        description="Specific macro/hydration focus tied to current physique and training load."
+    )
+    immediate_weekly_habit: str = Field(
+        description="One single, high-compliance dietary action for the next 7 days (no vague advice)."
+    )
+
+
+class PhysiqueAssessment(BaseModel):
+    current_shape_summary: str = Field(
+        description="Objective assessment of current body composition, muscle distribution, and posture relative to the stated goal."
+    )
+    delta_since_last_checkin: str = Field(
+        description="Specific visual changes since previous check-in and baseline (or 'Baseline check-in' if first photo)."
+    )
+    gap_to_goal: str = Field(
+        description="What specifically separates current shape from the target goal (e.g., shoulder-to-waist taper, conditioning, midsection leanness)."
+    )
+    verdict: CoachingVerdict
+    workout_adjustment: WorkoutAdjustment
+    diet_adjustment: DietAdjustment
 
 
 class PhysiqueCritique(BaseModel):
@@ -71,6 +122,23 @@ class AICoachService:
         self._model = _build_xai_model(self.settings)
         self._model_settings = ModelSettings(timeout=self.settings.ai_timeout_seconds)
 
+        self._assessment_agent = Agent(
+            self._model,
+            output_type=PhysiqueAssessment,
+            model_settings=self._model_settings,
+            system_prompt=(
+                "You are an elite strength, calisthenics, and physique coach replacing a personal trainer. "
+                "Evaluate the athlete's current physique shape against their stated goal, using previous and "
+                "baseline photos plus recent workout adherence data to measure real progress.\n\n"
+                "Rules:\n"
+                "1. Be direct, objective, and practical—never generic.\n"
+                "2. Ground every workout adjustment in visible proportions, posture, and stated goals.\n"
+                "3. Ground every diet adjustment in current body composition vs. goal AND recent training adherence "
+                "(do not prescribe aggressive deficits if training adherence is low).\n"
+                "4. Write `next_session_focus_prompt` as a crisp, actionable instruction ready for a workout generator."
+            ),
+        )
+
         self._physique_agent = Agent(
             self._model,
             output_type=PhysiqueCritique,
@@ -97,6 +165,50 @@ class AICoachService:
                 "requested). Respect all injury limits and always set completed=false on new tasks."
             ),
         )
+
+    async def evaluate_checkin(
+        self,
+        *,
+        current_webp: bytes,
+        previous_webp: bytes | None = None,
+        baseline_webp: bytes | None = None,
+        goal_summary: str,
+        preferred_style: str,
+        adherence_summary: str,
+        days_since_previous: int | None = None,
+    ) -> PhysiqueAssessment:
+        context_block = (
+            f"ATHLETE GOAL: {goal_summary}\n"
+            f"TRAINING STYLE: {preferred_style}\n"
+            f"RECENT EXECUTION ADHERENCE: {adherence_summary}\n"
+            f"DAYS SINCE LAST CHECK-IN: {days_since_previous if days_since_previous is not None else 'First check-in (Baseline)'}\n\n"
+            "Analyze the attached photos and output the structured PhysiqueAssessment."
+        )
+
+        content: list[str | BinaryContent] = [
+            context_block,
+            "CURRENT CHECK-IN PHOTO:",
+            BinaryContent(data=current_webp, media_type="image/webp"),
+        ]
+
+        if previous_webp:
+            content.extend(
+                [
+                    "PREVIOUS CHECK-IN PHOTO (for short-term delta):",
+                    BinaryContent(data=previous_webp, media_type="image/webp"),
+                ]
+            )
+
+        if baseline_webp:
+            content.extend(
+                [
+                    "BASELINE PHOTO (Day 1 reference):",
+                    BinaryContent(data=baseline_webp, media_type="image/webp"),
+                ]
+            )
+
+        result = await self._assessment_agent.run(content)
+        return result.output
 
     async def analyze_physique(
         self,

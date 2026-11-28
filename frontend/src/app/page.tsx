@@ -1,20 +1,55 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { api, fetchDevToken, UserProfile } from "@/lib/api";
 import { PhotoCheckinCard } from "@/features/photos/PhotoCheckinCard";
+import { PhotoHistoryCard } from "@/features/photos/PhotoHistoryCard";
 import { ProfileCard } from "@/features/profile/ProfileCard";
 import { WorkoutBoard } from "@/features/workouts/WorkoutBoard";
+
+interface ExternalFocusRequest {
+  id: string;
+  prompt: string;
+  autoGenerate?: boolean;
+}
 
 export default function KinetixDashboard() {
   const [token, setToken] = useState<string | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [statusMsg, setStatusMsg] = useState("Connecting...");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
+  const [focusRequest, setFocusRequest] = useState<ExternalFocusRequest | null>(
+    null,
+  );
 
   const refreshProfile = useCallback(async (authToken: string) => {
     const prof = await api.getProfile(authToken);
     setProfile(prof);
+  }, []);
+
+  const handlePhotoProcessed = useCallback(async () => {
+    if (token) {
+      await refreshProfile(token);
+    }
+    setHistoryRefreshKey((prev) => prev + 1);
+  }, [refreshProfile, token]);
+
+  const handleApplyWorkoutFocus = useCallback(async (focusPrompt: string) => {
+    const trimmed = focusPrompt.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    setFocusRequest({
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      prompt: trimmed,
+      autoGenerate: true,
+    });
+    return undefined;
+  }, []);
+
+  const handleExternalFocusConsumed = useCallback((requestId: string) => {
+    setFocusRequest((current) => (current?.id === requestId ? null : current));
   }, []);
 
   useEffect(() => {
@@ -37,7 +72,7 @@ export default function KinetixDashboard() {
         setStatusMsg("Offline");
       }
     }
-    init();
+    void init();
     return () => {
       active = false;
     };
@@ -91,7 +126,8 @@ export default function KinetixDashboard() {
             token={token}
             onStatusChange={setStatusMsg}
             onError={setErrorMsg}
-            onPhotoProcessed={() => (token ? refreshProfile(token) : undefined)}
+            onPhotoProcessed={handlePhotoProcessed}
+            onApplyWorkoutFocus={handleApplyWorkoutFocus}
           />
           <ProfileCard
             token={token}
@@ -102,10 +138,20 @@ export default function KinetixDashboard() {
           />
         </div>
 
+        <PhotoHistoryCard
+          token={token}
+          refreshTrigger={historyRefreshKey}
+          onStatusChange={setStatusMsg}
+          onError={setErrorMsg}
+          onApplyWorkoutFocus={handleApplyWorkoutFocus}
+        />
+
         <WorkoutBoard
           token={token}
           onStatusChange={setStatusMsg}
           onError={setErrorMsg}
+          externalFocusRequest={focusRequest}
+          onExternalFocusConsumed={handleExternalFocusConsumed}
         />
       </div>
     </main>
