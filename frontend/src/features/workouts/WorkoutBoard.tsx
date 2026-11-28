@@ -15,6 +15,7 @@ export function WorkoutBoard({
   onError,
 }: WorkoutBoardProps) {
   const [workout, setWorkout] = useState<DailyWorkout | null>(null);
+  const [sessionFocus, setSessionFocus] = useState("");
   const [loadingWorkout, setLoadingWorkout] = useState(false);
   const [togglingTaskIdx, setTogglingTaskIdx] = useState<number | null>(null);
 
@@ -22,9 +23,13 @@ export function WorkoutBoard({
     if (!token) return;
     setLoadingWorkout(true);
     onError(null);
-    onStatusChange(regenerate ? "Regenerating plan..." : "Loading plan...");
+    onStatusChange(
+      regenerate
+        ? "Regenerating bespoke plan..."
+        : "Generating bespoke plan...",
+    );
     try {
-      const plan = await api.generateWorkout(token, regenerate);
+      const plan = await api.generateWorkout(token, regenerate, sessionFocus);
       setWorkout(plan);
       onStatusChange("Workout ready");
     } catch (err) {
@@ -35,7 +40,8 @@ export function WorkoutBoard({
   }
 
   async function handleToggleTask(taskIndex: number, nextCompleted: boolean) {
-    if (!token || !workout?.id) return;
+    const workoutId = workout?.plan_id ?? workout?.id;
+    if (!token || !workout || !workoutId) return;
 
     const previousWorkout = workout;
     setWorkout({
@@ -50,11 +56,12 @@ export function WorkoutBoard({
     try {
       const updated = await api.patchWorkoutTask(
         token,
-        workout.id,
+        workoutId,
         taskIndex,
         nextCompleted,
       );
       setWorkout(updated);
+      onStatusChange(nextCompleted ? "Task completed" : "Task unmarked");
     } catch (err) {
       setWorkout(previousWorkout);
       onError(err instanceof Error ? err.message : "Failed to update task");
@@ -75,7 +82,8 @@ export function WorkoutBoard({
             Today&apos;s Workout
           </h2>
           <p className="text-xs text-zinc-400">
-            Tailored to your equipment, limits, and physique focus
+            Bespoke compound &amp; style-matched session built from your profile
+            and check-ins
           </p>
         </div>
         <div className="grid grid-cols-2 sm:flex gap-2">
@@ -96,6 +104,23 @@ export function WorkoutBoard({
             Regenerate
           </button>
         </div>
+      </div>
+
+      <div>
+        <label
+          htmlFor="session-focus-input"
+          className="block text-xs text-zinc-400 mb-1"
+        >
+          Today&apos;s Session Focus (optional)
+        </label>
+        <input
+          id="session-focus-input"
+          type="text"
+          value={sessionFocus}
+          onChange={(e) => setSessionFocus(e.target.value)}
+          placeholder="e.g. prison-style burpee & push-up ladder, high-density compounds, 25 mins"
+          className="w-full min-h-11 bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2 text-base sm:text-sm"
+        />
       </div>
 
       {workout && (

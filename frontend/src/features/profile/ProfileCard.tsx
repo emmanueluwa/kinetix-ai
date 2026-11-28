@@ -11,6 +11,37 @@ interface ProfileCardProps {
   onError: (msg: string | null) => void;
 }
 
+const STYLE_OPTIONS = [
+  { value: "calisthenics_prison", label: "Calisthenics / Prison-Style" },
+  { value: "hypertrophy", label: "Hypertrophy" },
+  { value: "strength", label: "Strength" },
+  { value: "recomposition", label: "Recomposition" },
+  { value: "athletic", label: "Athletic Conditioning" },
+];
+
+const MOVEMENT_TAG_MARKER = " | Favorite movements: ";
+
+function splitGoalAndMovements(rawGoal: string): {
+  goal: string;
+  movements: string;
+} {
+  const idx = rawGoal.indexOf(MOVEMENT_TAG_MARKER);
+  if (idx === -1) {
+    return { goal: rawGoal, movements: "" };
+  }
+  return {
+    goal: rawGoal.slice(0, idx),
+    movements: rawGoal.slice(idx + MOVEMENT_TAG_MARKER.length),
+  };
+}
+
+function combineGoalAndMovements(goal: string, movements: string): string {
+  const cleanGoal = goal.trim();
+  const cleanMovements = movements.trim();
+  if (!cleanMovements) return cleanGoal;
+  return `${cleanGoal}${MOVEMENT_TAG_MARKER}${cleanMovements}`;
+}
+
 export function ProfileCard({
   token,
   profile,
@@ -19,7 +50,10 @@ export function ProfileCard({
   onError,
 }: ProfileCardProps) {
   const [goalSummary, setGoalSummary] = useState("");
-  const [preferredStyle, setPreferredStyle] = useState("hypertrophy");
+  const [favoriteMovements, setFavoriteMovements] = useState(
+    "burpees, push-ups, compound bodyweight",
+  );
+  const [preferredStyle, setPreferredStyle] = useState("calisthenics_prison");
   const [equipmentInput, setEquipmentInput] = useState("");
   const [injuries, setInjuries] = useState("");
   const [daysPerWeek, setDaysPerWeek] = useState(4);
@@ -27,8 +61,12 @@ export function ProfileCard({
 
   useEffect(() => {
     if (!profile) return;
-    setGoalSummary(profile.goal_summary);
-    setPreferredStyle(profile.preferred_style);
+    const parsed = splitGoalAndMovements(profile.goal_summary);
+    setGoalSummary(parsed.goal);
+    if (parsed.movements) {
+      setFavoriteMovements(parsed.movements);
+    }
+    setPreferredStyle(profile.preferred_style || "calisthenics_prison");
     setEquipmentInput(profile.available_equipment.join(", "));
     setInjuries(profile.injuries_or_constraints ?? "");
     setDaysPerWeek(profile.days_per_week);
@@ -42,7 +80,7 @@ export function ProfileCard({
     onError(null);
     try {
       const updated = await api.saveProfile(token, {
-        goal_summary: goalSummary,
+        goal_summary: combineGoalAndMovements(goalSummary, favoriteMovements),
         preferred_style: preferredStyle,
         available_equipment: equipmentInput
           .split(",")
@@ -64,7 +102,7 @@ export function ProfileCard({
     <section className="bg-zinc-900/70 border border-zinc-800 rounded-2xl p-4 sm:p-6 space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h2 className="text-base sm:text-lg font-semibold">
-          Profile &amp; Equipment
+          Profile &amp; Training Style
         </h2>
         {profile && (
           <div className="flex gap-1.5 text-[11px] font-mono">
@@ -99,6 +137,7 @@ export function ProfileCard({
             type="text"
             value={goalSummary}
             onChange={(e) => setGoalSummary(e.target.value)}
+            placeholder="Lean athletic physique & work capacity"
             className="w-full min-h-11 bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2 text-base sm:text-sm"
             required
           />
@@ -114,10 +153,11 @@ export function ProfileCard({
               onChange={(e) => setPreferredStyle(e.target.value)}
               className="w-full min-h-11 bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2 text-base sm:text-sm"
             >
-              <option value="hypertrophy">Hypertrophy</option>
-              <option value="strength">Strength</option>
-              <option value="recomposition">Recomposition</option>
-              <option value="athletic">Athletic Conditioning</option>
+              {STYLE_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
             </select>
           </div>
           <div>
@@ -138,13 +178,26 @@ export function ProfileCard({
 
         <div>
           <label className="block text-xs text-zinc-400 mb-1">
+            Favorite Movements &amp; Style Notes
+          </label>
+          <input
+            type="text"
+            value={favoriteMovements}
+            onChange={(e) => setFavoriteMovements(e.target.value)}
+            placeholder="burpees, push-ups, compound bodyweight circuits"
+            className="w-full min-h-11 bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2 text-base sm:text-sm"
+          />
+        </div>
+
+        <div>
+          <label className="block text-xs text-zinc-400 mb-1">
             Equipment (comma-separated)
           </label>
           <input
             type="text"
             value={equipmentInput}
             onChange={(e) => setEquipmentInput(e.target.value)}
-            placeholder="dumbbells, pull-up bar, bench"
+            placeholder="bodyweight, pull-up bar, mat"
             className="w-full min-h-11 bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2 text-base sm:text-sm"
           />
         </div>

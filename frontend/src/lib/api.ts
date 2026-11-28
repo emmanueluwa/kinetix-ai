@@ -36,11 +36,13 @@ export interface WorkoutTask {
 }
 
 export interface DailyWorkout {
+  plan_id?: string;
   id?: string;
   plan_date: string;
   focus_area: string;
   rationale: string;
   tasks: WorkoutTask[];
+  completed?: boolean;
 }
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -140,14 +142,19 @@ export const api = {
   async generateWorkout(
     token: string,
     regenerate: boolean,
+    sessionRequest?: string | null,
   ): Promise<DailyWorkout> {
+    const trimmedRequest = sessionRequest?.trim() || null;
     const res = await fetch(`${API_BASE_URL}/api/v1/workouts/generate`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify({ regenerate }),
+      body: JSON.stringify({
+        regenerate,
+        session_request: trimmedRequest,
+      }),
     });
     return parseJsonOrThrow<DailyWorkout>(res, "Failed to load workout");
   },
