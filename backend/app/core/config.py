@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     # AI Providers (Primary + Failover)
     gemini_api_key: SecretStr
     openai_api_key: SecretStr | None = None
-    primary_vision_model: str = "gemini-2.5-flash"
+    primary_vision_model: str = "gemini-3.8-flash"
     fallback_vision_model: str = "openai:gpt-4o"
 
     # Rate Limiting (Requests per minute per user)
@@ -45,6 +45,11 @@ class Settings(BaseSettings):
 
     # Observability (Pydantic Logfire / OpenTelemetry)
     logfire_token: SecretStr | None = None
+
+    # xAI Grok configuration
+    xai_api_key: SecretStr | None = Field(default=None)
+    xai_model: str = Field(default="grok-4.7")
+    ai_timeout_seconds: float = Field(default=45.0, ge=5.0, le=180.0)
 
 
 @lru_cache

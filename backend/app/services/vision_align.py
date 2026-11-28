@@ -4,6 +4,8 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+import io
+from PIL import Image, ImageOps
 
 import cv2
 import mediapipe as mp
@@ -173,6 +175,17 @@ class PhysiqueVisionNormalizer:
         }
 
         encoded = self._encode_webp(aligned)
+
+        try:
+            pil_img = Image.open(io.BytesIO(image_bytes))
+            pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
+            rgb = np.array(pil_img)
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        except Exception as exc:
+            raise ValueError(
+                "Unable to decode image bytes for pose normalization."
+            ) from exc
+
         return AlignmentResult(
             aligned_image_bytes=encoded,
             pose_detected=True,

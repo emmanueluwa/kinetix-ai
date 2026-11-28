@@ -5,6 +5,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
@@ -106,6 +107,15 @@ class DailyWorkoutResponse(BaseModel):
     focus_area: str
     rationale: str
     tasks: list[dict[str, Any]]
+    completed: bool
+
+
+class GenerateWorkoutRequest(BaseModel):
+    regenerate: bool = False
+    session_request: str | None = Field(default=None, max_length=500)
+
+
+class TaskCompletionRequest(BaseModel):
     completed: bool
 
 
@@ -356,6 +366,149 @@ async def generate_todays_workout(
         completed=False,
     )
     db.add(plan)
+    await db.commit()
+    await db.refresh(plan)
+
+    return DailyWorkoutResponse(
+        plan_id=plan.id,
+        plan_date=plan.plan_date,
+        focus_area=plan.focus_area,
+        rationale=plan.rationale,
+        tasks=plan.tasks,
+        completed=plan.completed,
+    )
+
+
+@router.post(
+    "/workouts/generate",
+    response_model=DailyWorkoutResponse,
+    dependencies=[Depends(enforce_ai_rate_limit)],
+)
+async def generate_workout_plan(
+    body: GenerateWorkoutRequest,
+    user: Annotated[AuthenticatedUser, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db_session)],
+    coach: Annotated[AICoachService, Depends(get_ai_coach)],
+) -> DailyWorkoutResponse:
+    today = date.today()
+
+    existing_stmt = select(DailyWorkoutPlan).where(
+        DailyWorkoutPlan.user_id == user.user_id,
+        DailyWorkoutPlan.plan_date == today,
+    )
+    existing_plan = (await db.execute(existing_stmt)).scalar_one_or_none()
+
+    if existing_plan is not None and not body.regenerate and not body.session_request:
+        return DailyWorkoutResponse(
+            plan_id=existing_plan.id,
+            plan_date=existing_plan.plan_date,
+            focus_area=existing_plan.focus_area,
+            rationale=existing_plan.rationale,
+            tasks=existing_plan.tasks,
+            completed=existing_plan.completed,
+        )
+
+    profile = await db.get(UserProfile, user.user_id)
+    if profile is None:
+        profile = UserProfile(user_id=user.user_id)
+        db.add(profile)
+        await db.flush()
+
+    latest_photo_stmt = (
+        select(PhysiquePhoto)
+        .where(
+            PhysiquePhoto.user_id == user.user_id,
+            PhysiquePhoto.ai_analysis.is_not(None),
+        )
+        .order_by(PhysiquePhoto.created_at.desc())
+        .limit(1)
+    )
+    latest_photo = (await db.execute(latest_photo_stmt)).scalar_one_or_none()
+    latest_focus = (
+        latest_photo.ai_analysis.get("recommended_training_focus", [])
+        if latest_photo and latest_photo.ai_analysis
+        else ["Compound calisthenics & conditioning"]
+    )
+
+    coaching_context = (
+        f"Goal & Preferences: {profile.goal_summary}\n"
+        f"Training Style: {profile.preferred_style} ({profile.days_per_week} days/week)\n"
+        f"Available Equipment: {', '.join(profile.available_equipment) or 'Bodyweight only'}\n"
+        f"Injuries / Constraints: {profile.injuries_or_constraints or 'None'}\n"
+        f"Latest Physique Priority Areas: {', '.join(latest_focus)}\n"
+        f"Session Focus Request: {body.session_request or 'None—prioritize high-impact compound movements matching style'}\n"
+        f"Regenerate Variation: {'Yes—provide a fresh variation' if body.regenerate else 'No'}"
+    )
+
+    plan_output: WorkoutPlanOutput = await coach.generate_daily_workout(
+        coaching_context=coaching_context
+    )
+    serialized_tasks = [
+        {**task.model_dump(), "completed": False} for task in plan_output.tasks
+    ]
+
+    if existing_plan is not None:
+        existing_plan.focus_area = plan_output.focus_area
+        existing_plan.rationale = plan_output.rationale
+        existing_plan.tasks = serialized_tasks
+        existing_plan.completed = False
+        flag_modified(existing_plan, "tasks")
+        await db.commit()
+        await db.refresh(existing_plan)
+        plan = existing_plan
+    else:
+        plan = DailyWorkoutPlan(
+            user_id=user.user_id,
+            plan_date=today,
+            focus_area=plan_output.focus_area,
+            rationale=plan_output.rationale,
+            tasks=serialized_tasks,
+            completed=False,
+        )
+        db.add(plan)
+        await db.commit()
+        await db.refresh(plan)
+
+    return DailyWorkoutResponse(
+        plan_id=plan.id,
+        plan_date=plan.plan_date,
+        focus_area=plan.focus_area,
+        rationale=plan.rationale,
+        tasks=plan.tasks,
+        completed=plan.completed,
+    )
+
+
+@router.patch(
+    "/workouts/{plan_id}/tasks/{task_index}",
+    response_model=DailyWorkoutResponse,
+)
+async def toggle_workout_task(
+    plan_id: uuid.UUID,
+    task_index: int,
+    body: TaskCompletionRequest,
+    user: Annotated[AuthenticatedUser, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db_session)],
+) -> DailyWorkoutResponse:
+    plan = await db.get(DailyWorkoutPlan, plan_id)
+    if plan is None or plan.user_id != user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Workout plan not found.",
+        )
+
+    tasks = list(plan.tasks or [])
+    if task_index < 0 or task_index >= len(tasks):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid task index.",
+        )
+
+    tasks[task_index] = {**tasks[task_index], "completed": body.completed}
+    plan.tasks = tasks
+    plan.completed = len(tasks) > 0 and all(bool(t.get("completed")) for t in tasks)
+    flag_modified(plan, "tasks")
+
     await db.commit()
     await db.refresh(plan)
 

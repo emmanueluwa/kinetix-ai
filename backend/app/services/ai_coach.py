@@ -1,112 +1,100 @@
-from typing import Any
+from __future__ import annotations
 
+import os
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, BinaryContent
-from pydantic_ai.models.fallback import FallbackModel
-from pydantic_ai.models.google import GoogleModel
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.google import GoogleProvider
-from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.models.xai import XaiModel
+from pydantic_ai.providers.xai import XaiProvider
+from pydantic_ai.settings import ModelSettings
 
-from app.core.config import Settings
-
-
-class MuscleGroupAssessment(BaseModel):
-    muscle_group: str = Field(
-        ..., description="e.g., Deltoids, Upper Chest, Lats, Core, Quads"
-    )
-    visual_progress_notes: str = Field(
-        ..., description="Objective comparison against baseline and goal reference"
-    )
-    priority_level: str = Field(..., pattern="^(high|moderate|maintain)$")
+from app.core.config import Settings, get_settings
 
 
 class PhysiqueCritique(BaseModel):
-    overall_trajectory_score: int = Field(
-        ..., ge=1, le=100, description="1-100 alignment score toward goal physique"
+    summary: str = Field(
+        description="Concise assessment of current physique and alignment"
     )
-    body_composition_summary: str = Field(
-        ..., description="Honest, grounded summary of leanness and muscularity changes"
-    )
-    pose_and_lighting_caveats: str = Field(
-        ..., description="Any remaining angle or lighting differences to keep in mind"
-    )
-    muscle_assessments: list[MuscleGroupAssessment] = Field(
-        ..., min_length=2, max_length=6
+    proportion_observations: list[str] = Field(
+        default_factory=list,
+        description="Observations on proportions, symmetry, and posture",
     )
     recommended_training_focus: list[str] = Field(
-        ...,
-        min_length=2,
-        max_length=4,
-        description="Specific areas to prioritize next 2 weeks",
+        default_factory=list,
+        description="Priority training areas for upcoming sessions",
     )
 
 
-class WorkoutTaskItem(BaseModel):
-    exercise_name: str
-    target_muscle: str
-    sets: int = Field(..., ge=1, le=8)
-    rep_range: str = Field(..., description="e.g., 8-12 or 12-15")
-    rest_seconds: int = Field(..., ge=30, le=240)
-    equipment_used: str
-    execution_cue: str = Field(..., description="Concise biomechanical form cue")
+class WorkoutTaskOutput(BaseModel):
+    exercise_name: str = Field(description="Compound or calisthenics movement name")
+    target_muscle: str = Field(description="Primary target muscle group")
+    equipment_used: str = Field(description="Bodyweight or specific equipment used")
+    sets: int = Field(ge=1, le=10)
+    rep_range: str = Field(description="Reps, ladder scheme, or timed work interval")
+    rest_seconds: int = Field(ge=15, le=240)
+    execution_cue: str = Field(description="Actionable form or pacing cue")
+    completed: bool = Field(default=False)
 
 
 class WorkoutPlanOutput(BaseModel):
-    focus_area: str = Field(
-        ..., description="e.g., Upper Body Hypertrophy & Lateral Delts"
-    )
+    focus_area: str = Field(description="Primary focus of today's session")
     rationale: str = Field(
-        ...,
-        description="Why this session matches current physique priorities and equipment",
+        description="Why this workout matches goals, style, and check-ins"
     )
-    tasks: list[WorkoutTaskItem] = Field(..., min_length=4, max_length=8)
+    tasks: list[WorkoutTaskOutput] = Field(min_length=3, max_length=7)
 
 
-def _build_resilient_model(settings: Settings) -> Any:
-    """Create primary Gemini model with automatic OpenAI fallback if configured."""
-    primary = GoogleModel(
-        settings.primary_vision_model,
-        provider=GoogleProvider(api_key=settings.gemini_api_key.get_secret_value()),
+def _resolve_xai_api_key(settings: Settings) -> str:
+    if settings.xai_api_key is not None:
+        secret = settings.xai_api_key.get_secret_value().strip()
+        if secret:
+            return secret
+    env_key = (os.environ.get("XAI_API_KEY") or "").strip()
+    if env_key:
+        return env_key
+    raise RuntimeError(
+        "XAI_API_KEY is not configured. Set XAI_API_KEY in backend/.env or your environment."
     )
-    if settings.openai_api_key:
-        fallback_name = settings.fallback_vision_model.removeprefix("openai:")
-        fallback = OpenAIChatModel(
-            fallback_name,
-            provider=OpenAIProvider(api_key=settings.openai_api_key.get_secret_value()),
-        )
-        return FallbackModel(primary, fallback)
-    return primary
+
+
+def _build_xai_model(settings: Settings) -> XaiModel:
+    api_key = _resolve_xai_api_key(settings)
+    provider = XaiProvider(
+        api_key=api_key,
+        timeout=settings.ai_timeout_seconds,
+    )
+    return XaiModel(settings.xai_model, provider=provider)
 
 
 class AICoachService:
-    """Production PydanticAI agents for physique analysis and adaptive workout programming."""
+    def __init__(self, settings: Settings | None = None) -> None:
+        self.settings = settings or get_settings()
+        self._model = _build_xai_model(self.settings)
+        self._model_settings = ModelSettings(timeout=self.settings.ai_timeout_seconds)
 
-    def __init__(self, settings: Settings) -> None:
-        model = _build_resilient_model(settings)
-
-        self.physique_agent: Agent[None, PhysiqueCritique] = Agent(
-            model=model,
+        self._physique_agent = Agent(
+            self._model,
             output_type=PhysiqueCritique,
-            retries=2,
+            model_settings=self._model_settings,
             system_prompt=(
-                "You are an elite physique and biomechanics coach. Compare the user's "
-                "pose-normalized current physique image against their starting baseline and "
-                "goal reference image. Ground your critique in the provided deterministic "
-                "MediaPipe anthropometric ratios (shoulder-to-waist, waist-to-hip) and scale "
-                "weight rather than guessing proportions. Be objective, encouraging, and direct."
+                "You are an objective physique and biomechanics coach. "
+                "Analyze the athlete's normalized check-in image alongside any baseline/goal "
+                "images and ratio metrics. Give clear, practical observations and priority "
+                "training areas without fluff."
             ),
         )
 
-        self.workout_agent: Agent[None, WorkoutPlanOutput] = Agent(
-            model=model,
+        self._workout_agent = Agent(
+            self._model,
             output_type=WorkoutPlanOutput,
-            retries=2,
+            model_settings=self._model_settings,
             system_prompt=(
-                "You are an expert strength and hypertrophy programmer. Generate a practical, "
-                "high-impact daily workout session strictly using ONLY the user's listed "
-                "available equipment while respecting any injuries/constraints. Tailor exercise "
-                "selection directly to their latest physique priority areas."
+                "You are an elite calisthenics, strength, and physique coach. "
+                "Generate a bespoke, high-efficiency daily workout tailored strictly to the "
+                "athlete's training style, favorite movements, goal summary, available equipment, "
+                "injury constraints, physique priorities, and optional session focus request. "
+                "Prioritize high-density compound movements (such as burpees, push-up variations, "
+                "pull-ups, dips, squats, and core density blocks when prison-style calisthenics is "
+                "requested). Respect all injury limits and always set completed=false on new tasks."
             ),
         )
 
@@ -114,31 +102,39 @@ class AICoachService:
         self,
         *,
         current_webp: bytes,
-        baseline_webp: bytes | None,
-        goal_webp: bytes | None,
+        baseline_webp: bytes | None = None,
+        goal_webp: bytes | None = None,
         metrics_context: str,
     ) -> PhysiqueCritique:
-        prompt_parts: list[Any] = [
-            f"Analyze the user's latest progress photo.\n\n{metrics_context}\n\n"
-            "Image 1 is the CURRENT pose-normalized progress photo."
+        content: list[str | BinaryContent] = [
+            metrics_context,
+            "Current check-in image (aligned WebP):",
+            BinaryContent(data=current_webp, media_type="image/webp"),
         ]
-        prompt_parts.append(BinaryContent(data=current_webp, media_type="image/webp"))
 
-        if baseline_webp is not None:
-            prompt_parts.append("Next image is the STARTING BASELINE photo:")
-            prompt_parts.append(
-                BinaryContent(data=baseline_webp, media_type="image/webp")
+        if baseline_webp:
+            content.extend(
+                [
+                    "Baseline reference image (WebP):",
+                    BinaryContent(data=baseline_webp, media_type="image/webp"),
+                ]
             )
 
-        if goal_webp is not None:
-            prompt_parts.append("Next image is the TARGET GOAL physique reference:")
-            prompt_parts.append(BinaryContent(data=goal_webp, media_type="image/webp"))
+        if goal_webp:
+            content.extend(
+                [
+                    "Goal reference image (WebP):",
+                    BinaryContent(data=goal_webp, media_type="image/webp"),
+                ]
+            )
 
-        result = await self.physique_agent.run(prompt_parts)
+        result = await self._physique_agent.run(content)
         return result.output
 
     async def generate_daily_workout(
-        self, *, coaching_context: str
+        self,
+        *,
+        coaching_context: str,
     ) -> WorkoutPlanOutput:
-        result = await self.workout_agent.run(coaching_context)
+        result = await self._workout_agent.run(coaching_context)
         return result.output
